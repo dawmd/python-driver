@@ -503,6 +503,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
             return
 
         replicas = []
+        leader_host = None
         tablet = self._cluster_metadata._tablets.get_tablet_for_key(
             keyspace, query.table, self._cluster_metadata.token_map.token_class.from_key(query.routing_key))
 
@@ -511,6 +512,15 @@ class TokenAwarePolicy(LoadBalancingPolicy):
             child_plan = child.make_query_plan(keyspace, query)
 
             replicas = [host for host in child_plan if host.host_id in replicas_mapped]
+
+            # When V2 routing is active (tablet has a version), the first replica
+            # in the list is the leader. Yield it first for leader-aware routing.
+            if tablet.tablet_version is not None and tablet.replicas:
+                leader_host_id = tablet.replicas[0][0]
+                for host in replicas:
+                    if host.host_id == leader_host_id:
+                        leader_host = host
+                        break
         else:
             replicas = self._cluster_metadata.get_replicas(keyspace, query.routing_key)
 
@@ -523,10 +533,18 @@ class TokenAwarePolicy(LoadBalancingPolicy):
                     if replica.is_up and child.distance(replica) == distance:
                         yield replica
 
-        # yield replicas: local_rack, local, remote
-        yield from yield_in_order(replicas)
+        # If we have a leader hint, yield it first unconditionally.
+        if leader_host is not None and leader_host.is_up:
+            yield leader_host
+
+        # yield replicas: local_rack, local, remote (skipping leader already yielded)
+        for host in yield_in_order(replicas):
+            if host is not leader_host:
+                yield host
         # yield rest of the cluster: local_rack, local, remote
-        yield from yield_in_order([host for host in child.make_query_plan(keyspace, query) if host not in replicas])
+        for host in yield_in_order([host for host in child.make_query_plan(keyspace, query) if host not in replicas]):
+            if host is not leader_host:
+                yield host
 
     def on_up(self, *args, **kwargs):
         return self._child_policy.on_up(*args, **kwargs)

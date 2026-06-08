@@ -457,7 +457,27 @@ class HostConnection(object):
             t = self._session.cluster.metadata.token_map.token_class.from_key(routing_key)
             
             shard_id = None
-            if self.tablets_routing_v1 and table is not None:
+            if self.tablets_routing_v2 and table is not None:
+                if keyspace is None:
+                    keyspace = self._keyspace
+
+                tablet = self._session.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
+
+                if tablet is not None and tablet.tablet_version is not None:
+                    # V2 leader-aware: use the leader's shard (first replica) if
+                    # this host is the leader; otherwise use our shard from the
+                    # replica list.
+                    for replica in tablet.replicas:
+                        if replica[0] == self.host.host_id:
+                            shard_id = replica[1]
+                            break
+                elif tablet is not None:
+                    # Tablet without version (V1-style): use our shard.
+                    for replica in tablet.replicas:
+                        if replica[0] == self.host.host_id:
+                            shard_id = replica[1]
+                            break
+            elif self.tablets_routing_v1 and table is not None:
                 if keyspace is None:
                     keyspace = self._keyspace
 
