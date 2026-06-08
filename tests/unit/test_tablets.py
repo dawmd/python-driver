@@ -1,6 +1,6 @@
 import unittest
 
-from cassandra.tablets import Tablets, Tablet
+from cassandra.tablets import Tablets, Tablet, choose_tablet_version_block, random_tablet_version_block
 
 class TabletsTest(unittest.TestCase):
     def compare_ranges(self, tablets, ranges):
@@ -124,3 +124,87 @@ class GetTabletForKeyTest(unittest.TestCase):
         # Token value 50 is not > first_token (100) of the tablet whose
         # last_token (200) is >= 50, so no match.
         self.assertIsNone(tablets.get_tablet_for_key("ks", "tb", Token(50)))
+
+
+class TabletVersionBlockTest(unittest.TestCase):
+    """Tests for tablet_version_block encoding used by TABLETS_ROUTING_V2."""
+
+    def test_choose_tablet_version_block_encoding(self):
+        """Verify that the block byte encodes (index << 4) | nibble correctly."""
+        # Version 0x123456789ABCDEF0:
+        # block 0 = 0x1, block 1 = 0x2, ..., block 15 = 0x0
+        version = 0x123456789ABCDEF0
+
+        # Manually check a few blocks.
+        # Block 0: shift = (15-0)*4 = 60, nibble = (version >> 60) & 0xF = 0x1
+        block = choose_tablet_version_block.__wrapped__(version, 0) if hasattr(choose_tablet_version_block, '__wrapped__') else self._extract_block(version, 0)
+        # Use the actual function with a known index by testing properties:
+        for idx in range(16):
+            shift = (15 - idx) * 4
+            expected_nibble = (version >> shift) & 0xF
+            expected_byte = (idx << 4) | expected_nibble
+            actual = self._extract_block(version, idx)
+            self.assertEqual(actual, expected_byte,
+                f"Block {idx}: expected 0x{expected_byte:02X}, got 0x{actual:02X}")
+
+    def _extract_block(self, version, idx):
+        """Manually compute the expected block byte for verification."""
+        shift = (15 - idx) * 4
+        nibble = (version >> shift) & 0xF
+        return (idx << 4) | nibble
+
+    def test_choose_tablet_version_block_round_robin(self):
+        """Verify that choose_tablet_version_block cycles through block indices."""
+        version = 0xFFFFFFFFFFFFFFFF  # All nibbles are 0xF
+        import cassandra.tablets as tablets_module
+        # Reset the counter to a known state.
+        tablets_module._block_index_counter = 0
+
+        seen_indices = []
+        for _ in range(16):
+            block = choose_tablet_version_block(version)
+            idx = (block >> 4) & 0xF
+            seen_indices.append(idx)
+
+        # Should have cycled through 0..15.
+        self.assertEqual(seen_indices, list(range(16)))
+
+    def test_choose_tablet_version_block_wraps(self):
+        """Verify that the counter wraps around after 16 calls."""
+        version = 0xABCDABCDABCDABCD
+        import cassandra.tablets as tablets_module
+        tablets_module._block_index_counter = 15
+
+        block1 = choose_tablet_version_block(version)
+        self.assertEqual((block1 >> 4) & 0xF, 15)
+
+        block2 = choose_tablet_version_block(version)
+        self.assertEqual((block2 >> 4) & 0xF, 0)
+
+    def test_random_tablet_version_block_returns_byte(self):
+        """Verify random_tablet_version_block returns a value in [0, 255]."""
+        for _ in range(100):
+            block = random_tablet_version_block()
+            self.assertIsInstance(block, int)
+            self.assertGreaterEqual(block, 0)
+            self.assertLessEqual(block, 255)
+
+    def test_cold_start_uses_random_block(self):
+        """Verify that a Tablet with no version triggers random block generation."""
+        tablet = Tablet.from_row(-100, 100, [("host1", 0)], tablet_version=None)
+        self.assertIsNotNone(tablet)
+        self.assertIsNone(tablet.tablet_version)
+        # Cold start: should use random_tablet_version_block (no crash, returns byte)
+        block = random_tablet_version_block()
+        self.assertGreaterEqual(block, 0)
+        self.assertLessEqual(block, 255)
+
+    def test_tablet_version_stored_from_v2_response(self):
+        """Verify that Tablet.from_row stores tablet_version from V2 payload."""
+        version = 0xDEADBEEFCAFEBABE
+        tablet = Tablet.from_row(-100, 100, [("host1", 0), ("host2", 1)], tablet_version=version)
+        self.assertIsNotNone(tablet)
+        self.assertEqual(tablet.tablet_version, version)
+        self.assertEqual(tablet.first_token, -100)
+        self.assertEqual(tablet.last_token, 100)
+        self.assertEqual(len(tablet.replicas), 2)

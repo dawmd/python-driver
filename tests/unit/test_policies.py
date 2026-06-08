@@ -943,6 +943,129 @@ class TokenAwarePolicyTest(unittest.TestCase):
                 child_policy.make_query_plan.assert_called_once_with(keyspace, query)
             assert patched_shuffle.call_count == 1
 
+    def test_leader_aware_routing_with_tablet_version(self):
+        """
+        When a tablet has a tablet_version (V2 routing info), the leader
+        (first replica in the list) should be yielded first in the query plan.
+        """
+        hosts = [Host(DefaultEndPoint(str(i)), SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(4)]
+        for host in hosts:
+            host.set_up()
+            host.set_location_info("dc1", "rack1")
+
+        # The leader is hosts[2] (first in tablet.replicas).
+        leader = hosts[2]
+        other_replica = hosts[3]
+        tablet = Tablet(
+            first_token=-100, last_token=100,
+            replicas=[(leader.host_id, 0), (other_replica.host_id, 1)],
+            tablet_version=0xDEADBEEF12345678
+        )
+
+        cluster = Mock(spec=Cluster)
+        cluster.metadata = Mock(spec=Metadata)
+        cluster.metadata._tablets = Mock(spec=Tablets)
+        cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
+        cluster.metadata.get_replicas.return_value = [leader, other_replica]
+
+        child_policy = Mock()
+        child_policy.make_query_plan.return_value = hosts
+        child_policy.distance.return_value = HostDistance.LOCAL
+
+        policy = TokenAwarePolicy(child_policy)
+        policy.populate(cluster, hosts)
+
+        query = Statement(routing_key=b'\x00\x00\x00\x01', keyspace='ks', table='tbl')
+        qplan = list(policy.make_query_plan(None, query))
+
+        # Leader must be first.
+        self.assertEqual(qplan[0], leader)
+        # Leader should not appear again later in the plan.
+        self.assertEqual(qplan.count(leader), 1)
+        # Other replica should also appear.
+        self.assertIn(other_replica, qplan)
+
+    def test_leader_fallback_when_leader_is_down(self):
+        """
+        When the leader host is down, the driver should fall back to other
+        replicas without crashing. The leader should NOT appear in the plan.
+        """
+        hosts = [Host(DefaultEndPoint(str(i)), SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(4)]
+        for host in hosts:
+            host.set_up()
+            host.set_location_info("dc1", "rack1")
+
+        leader = hosts[2]
+        other_replica = hosts[3]
+        leader.set_down()  # Simulate leader being unreachable.
+
+        tablet = Tablet(
+            first_token=-100, last_token=100,
+            replicas=[(leader.host_id, 0), (other_replica.host_id, 1)],
+            tablet_version=0xCAFEBABE00000001
+        )
+
+        cluster = Mock(spec=Cluster)
+        cluster.metadata = Mock(spec=Metadata)
+        cluster.metadata._tablets = Mock(spec=Tablets)
+        cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
+        cluster.metadata.get_replicas.return_value = [leader, other_replica]
+
+        child_policy = Mock()
+        child_policy.make_query_plan.return_value = hosts
+        child_policy.distance.return_value = HostDistance.LOCAL
+
+        policy = TokenAwarePolicy(child_policy)
+        policy.populate(cluster, hosts)
+
+        query = Statement(routing_key=b'\x00\x00\x00\x01', keyspace='ks', table='tbl')
+        qplan = list(policy.make_query_plan(None, query))
+
+        # Leader is down, should not appear in the plan.
+        self.assertNotIn(leader, qplan)
+        # Other replica should be first.
+        self.assertEqual(qplan[0], other_replica)
+
+    def test_no_leader_routing_without_tablet_version(self):
+        """
+        When a tablet has no tablet_version (V1 behavior), the leader-first
+        optimization should NOT apply. Replicas should follow normal ordering.
+        """
+        hosts = [Host(DefaultEndPoint(str(i)), SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(4)]
+        for host in hosts:
+            host.set_up()
+            host.set_location_info("dc1", "rack1")
+
+        # Tablet without version (V1-style).
+        tablet = Tablet(
+            first_token=-100, last_token=100,
+            replicas=[(hosts[2].host_id, 0), (hosts[3].host_id, 1)],
+            tablet_version=None
+        )
+
+        cluster = Mock(spec=Cluster)
+        cluster.metadata = Mock(spec=Metadata)
+        cluster.metadata._tablets = Mock(spec=Tablets)
+        cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
+        cluster.metadata.get_replicas.return_value = [hosts[2], hosts[3]]
+
+        child_policy = Mock()
+        child_policy.make_query_plan.return_value = hosts
+        child_policy.distance.return_value = HostDistance.LOCAL
+
+        policy = TokenAwarePolicy(child_policy)
+        policy.populate(cluster, hosts)
+
+        query = Statement(routing_key=b'\x00\x00\x00\x01', keyspace='ks', table='tbl')
+        qplan = list(policy.make_query_plan(None, query))
+
+        # Without tablet_version, no leader-first logic. Both replicas appear
+        # but not necessarily with hosts[2] first (depends on child policy order).
+        # Just verify all hosts appear and no crash.
+        self.assertEqual(len(qplan), 4)
+        self.assertIn(hosts[2], qplan)
+        self.assertIn(hosts[3], qplan)
+
 
 class ConvictionPolicyTest(unittest.TestCase):
     def test_not_implemented(self):
