@@ -3765,6 +3765,7 @@ class ControlConnection(object):
 
     _uses_peers_v2 = True
     _tablets_routing_v1 = False
+    _tablets_routing_v2 = False
 
     # for testing purposes
     _time = time
@@ -3899,6 +3900,7 @@ class ControlConnection(object):
             else datetime.timedelta(seconds=self._cluster.metadata_request_timeout)
 
         self._tablets_routing_v1 = connection.features.tablets_routing_v1
+        self._tablets_routing_v2 = connection.features.tablets_routing_v2
 
         # use weak references in both directions
         # _clear_watcher will be called when this ControlConnection is about to be finalized

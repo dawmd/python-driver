@@ -392,6 +392,7 @@ class HostConnection(object):
     max_excess_connections_per_shard_multiplier = 3
 
     tablets_routing_v1 = False
+    tablets_routing_v2 = False
 
     def __init__(self, host, host_distance, session):
         self.host = host
@@ -439,6 +440,7 @@ class HostConnection(object):
             self.host.sharding_info = first_connection.features.sharding_info
             self._open_connections_for_all_shards(first_connection.features.shard_id)
         self.tablets_routing_v1 = first_connection.features.tablets_routing_v1
+        self.tablets_routing_v2 = first_connection.features.tablets_routing_v2
 
         log.debug("Finished initializing connection for host %s", self.host)
 
