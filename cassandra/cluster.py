@@ -85,7 +85,7 @@ from cassandra.query import (SimpleStatement, PreparedStatement, BoundStatement,
                              named_tuple_factory, dict_factory, tuple_factory, FETCH_SIZE_UNSET,
                              HostTargetingStatement)
 from cassandra.marshal import int64_pack
-from cassandra.tablets import Tablet, Tablets
+from cassandra.tablets import Tablet, Tablets, choose_tablet_version_block, random_tablet_version_block
 from cassandra.timestamps import MonotonicTimestampGenerator
 from cassandra.util import _resolve_contact_points_to_string_map, Version, maybe_add_timeout_to_query
 
@@ -3059,12 +3059,16 @@ class Session(object):
                 continuous_paging_options, statement_keyspace)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
+            tablet_version_block = None
+            if self.cluster.control_connection._tablets_routing_v2:
+                tablet_version_block = self._compute_tablet_version_block(query)
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
                 skip_meta=bool(prepared_statement.result_metadata),
                 continuous_paging_options=continuous_paging_options,
-                result_metadata_id=prepared_statement.result_metadata_id)
+                result_metadata_id=prepared_statement.result_metadata_id,
+                tablet_version_block=tablet_version_block)
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -3092,6 +3096,31 @@ class Session(object):
             prepared_statement=prepared_statement, retry_policy=retry_policy, row_factory=row_factory,
             load_balancer=load_balancing_policy, start_time=start_time, speculative_execution_plan=spec_exec_plan,
             continuous_paging_state=None, host=host)
+
+    def _compute_tablet_version_block(self, query):
+        """
+        Compute the tablet_version_block byte for a BoundStatement.
+        Returns an int in [0, 255] or None if V2 should not be used.
+        """
+        routing_key = query.routing_key
+        if routing_key is None:
+            return random_tablet_version_block()
+
+        keyspace = query.keyspace or self.keyspace
+        table = query.table
+        if not keyspace or not table:
+            return random_tablet_version_block()
+
+        token_map = self.cluster.metadata.token_map
+        if token_map is None:
+            return random_tablet_version_block()
+
+        t = token_map.token_class.from_key(routing_key)
+        tablet = self.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
+        if tablet is None or tablet.tablet_version is None:
+            return random_tablet_version_block()
+
+        return choose_tablet_version_block(tablet.tablet_version)
 
     def get_execution_profile(self, name):
         """

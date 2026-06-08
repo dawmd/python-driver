@@ -1,5 +1,6 @@
 from bisect import bisect_left
 from operator import attrgetter
+from os import urandom
 from threading import Lock
 from typing import Optional
 from uuid import UUID
@@ -7,6 +8,31 @@ from uuid import UUID
 # C-accelerated attrgetter avoids per-call lambda allocation overhead
 _get_first_token = attrgetter("first_token")
 _get_last_token = attrgetter("last_token")
+
+# Counter for round-robin block index selection (0-15).
+_block_index_counter = 0
+
+
+def choose_tablet_version_block(tablet_version):
+    """
+    Encode a tablet_version_block byte from a cached tablet_version.
+    Picks a block index round-robin across calls.
+    Returns an int in [0, 255].
+    """
+    global _block_index_counter
+    idx = _block_index_counter & 0xF
+    _block_index_counter = (_block_index_counter + 1) & 0xF
+    # Extract the 4-bit nibble at position `idx` (0 = most significant).
+    shift = (15 - idx) * 4
+    nibble = (tablet_version >> shift) & 0xF
+    return (idx << 4) | nibble
+
+
+def random_tablet_version_block():
+    """
+    Generate a random tablet_version_block byte for cold start.
+    """
+    return urandom(1)[0]
 
 
 class Tablet(object):
