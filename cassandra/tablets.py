@@ -18,15 +18,17 @@ class Tablet(object):
     first_token = 0
     last_token = 0
     replicas = None
+    tablet_version = None  # uint64 hash; None means unknown (cold start)
 
-    def __init__(self, first_token=0, last_token=0, replicas=None):
+    def __init__(self, first_token=0, last_token=0, replicas=None, tablet_version=None):
         self.first_token = first_token
         self.last_token = last_token
         self.replicas = replicas
+        self.tablet_version = tablet_version
 
     def __str__(self):
-        return "<Tablet: first_token=%s last_token=%s replicas=%s>" \
-               % (self.first_token, self.last_token, self.replicas)
+        return "<Tablet: first_token=%s last_token=%s replicas=%s tablet_version=%s>" \
+               % (self.first_token, self.last_token, self.replicas, self.tablet_version)
     __repr__ = __str__
 
     @staticmethod
@@ -34,9 +36,9 @@ class Tablet(object):
         return replicas is not None and len(replicas) != 0
 
     @staticmethod
-    def from_row(first_token, last_token, replicas):
+    def from_row(first_token, last_token, replicas, tablet_version=None):
         if Tablet._is_valid_tablet(replicas):
-            tablet = Tablet(first_token, last_token, replicas)
+            tablet = Tablet(first_token, last_token, replicas, tablet_version)
             return tablet
         return None
 
