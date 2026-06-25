@@ -513,9 +513,15 @@ class TokenAwarePolicy(LoadBalancingPolicy):
 
             replicas = [host for host in child_plan if host.host_id in replicas_mapped]
 
-            # When V2 routing is active (tablet has a version), the first replica
-            # in the list is the leader. Yield it first for leader-aware routing.
-            if tablet.tablet_version is not None and tablet.replicas:
+            # The leader concept only exists for strongly-consistent keyspaces.
+            # TABLETS_ROUTING_V2 assigns a tablet_version to *every* tablet table
+            # (eventually- and strongly-consistent alike), so the version alone
+            # must not be used to infer a leader. For strongly-consistent
+            # keyspaces the first replica is the leader; yield it first for
+            # leader-aware routing. Eventually-consistent keyspaces keep normal
+            # token-aware/shuffled ordering.
+            ks_meta = self._cluster_metadata.keyspaces.get(keyspace)
+            if ks_meta is not None and ks_meta.strongly_consistent and tablet.replicas:
                 leader_host_id = tablet.replicas[0][0]
                 for host in replicas:
                     if host.host_id == leader_host_id:

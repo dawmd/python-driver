@@ -945,8 +945,8 @@ class TokenAwarePolicyTest(unittest.TestCase):
 
     def test_leader_aware_routing_with_tablet_version(self):
         """
-        When a tablet has a tablet_version (V2 routing info), the leader
-        (first replica in the list) should be yielded first in the query plan.
+        For a strongly-consistent keyspace, the leader (first replica in the
+        list) should be yielded first in the query plan.
         """
         hosts = [Host(DefaultEndPoint(str(i)), SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(4)]
         for host in hosts:
@@ -967,6 +967,7 @@ class TokenAwarePolicyTest(unittest.TestCase):
         cluster.metadata._tablets = Mock(spec=Tablets)
         cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
         cluster.metadata.get_replicas.return_value = [leader, other_replica]
+        cluster.metadata.keyspaces = {'ks': Mock(strongly_consistent=True)}
 
         child_policy = Mock()
         child_policy.make_query_plan.return_value = hosts
@@ -1010,6 +1011,7 @@ class TokenAwarePolicyTest(unittest.TestCase):
         cluster.metadata._tablets = Mock(spec=Tablets)
         cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
         cluster.metadata.get_replicas.return_value = [leader, other_replica]
+        cluster.metadata.keyspaces = {'ks': Mock(strongly_consistent=True)}
 
         child_policy = Mock()
         child_policy.make_query_plan.return_value = hosts
@@ -1048,6 +1050,7 @@ class TokenAwarePolicyTest(unittest.TestCase):
         cluster.metadata._tablets = Mock(spec=Tablets)
         cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
         cluster.metadata.get_replicas.return_value = [hosts[2], hosts[3]]
+        cluster.metadata.keyspaces = {'ks': Mock(strongly_consistent=False)}
 
         child_policy = Mock()
         child_policy.make_query_plan.return_value = hosts
@@ -1065,6 +1068,95 @@ class TokenAwarePolicyTest(unittest.TestCase):
         self.assertEqual(len(qplan), 4)
         self.assertIn(hosts[2], qplan)
         self.assertIn(hosts[3], qplan)
+
+    def test_no_leader_routing_for_eventually_consistent_keyspace(self):
+        """
+        A tablet_version is assigned to eventually-consistent tablet tables too
+        (TABLETS_ROUTING_V2), but the leader concept only exists for
+        strongly-consistent keyspaces. For an eventually-consistent keyspace the
+        leader-first optimization must NOT apply even when a tablet_version is
+        present.
+        """
+        hosts = [Host(DefaultEndPoint(str(i)), SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(4)]
+        for host in hosts:
+            host.set_up()
+            host.set_location_info("dc1", "rack1")
+
+        first_replica = hosts[2]
+        second_replica = hosts[3]
+        tablet = Tablet(
+            first_token=-100, last_token=100,
+            replicas=[(first_replica.host_id, 0), (second_replica.host_id, 1)],
+            tablet_version=0xDEADBEEF12345678
+        )
+
+        cluster = Mock(spec=Cluster)
+        cluster.metadata = Mock(spec=Metadata)
+        cluster.metadata._tablets = Mock(spec=Tablets)
+        cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
+        cluster.metadata.get_replicas.return_value = [first_replica, second_replica]
+        cluster.metadata.keyspaces = {'ks': Mock(strongly_consistent=False)}
+
+        child_policy = Mock()
+        # Order the child plan so the second replica comes before the first; if
+        # leader-first logic wrongly triggered, first_replica would be forced to
+        # the front instead.
+        child_policy.make_query_plan.return_value = [second_replica, first_replica, hosts[0], hosts[1]]
+        child_policy.distance.return_value = HostDistance.LOCAL
+
+        # shuffle_replicas=False keeps replica ordering deterministic so we can
+        # assert that no leader is forced to the front.
+        policy = TokenAwarePolicy(child_policy, shuffle_replicas=False)
+        policy.populate(cluster, hosts)
+
+        query = Statement(routing_key=b'\x00\x00\x00\x01', keyspace='ks', table='tbl')
+        qplan = list(policy.make_query_plan(None, query))
+
+        # Leader-first must NOT apply: ordering follows the child plan, so the
+        # second replica (not replicas[0]) stays first.
+        self.assertEqual(qplan[0], second_replica)
+        self.assertEqual(len(qplan), 4)
+
+    def test_no_leader_routing_when_keyspace_metadata_missing(self):
+        """
+        If keyspace metadata is unavailable (e.g. schema refresh disabled), the
+        policy must safely fall back to no leader-first routing rather than
+        crashing or guessing.
+        """
+        hosts = [Host(DefaultEndPoint(str(i)), SimpleConvictionPolicy, host_id=uuid.uuid4()) for i in range(4)]
+        for host in hosts:
+            host.set_up()
+            host.set_location_info("dc1", "rack1")
+
+        first_replica = hosts[2]
+        second_replica = hosts[3]
+        tablet = Tablet(
+            first_token=-100, last_token=100,
+            replicas=[(first_replica.host_id, 0), (second_replica.host_id, 1)],
+            tablet_version=0xDEADBEEF12345678
+        )
+
+        cluster = Mock(spec=Cluster)
+        cluster.metadata = Mock(spec=Metadata)
+        cluster.metadata._tablets = Mock(spec=Tablets)
+        cluster.metadata._tablets.get_tablet_for_key.return_value = tablet
+        cluster.metadata.get_replicas.return_value = [first_replica, second_replica]
+        cluster.metadata.keyspaces = {}  # no metadata for 'ks'
+
+        child_policy = Mock()
+        child_policy.make_query_plan.return_value = [second_replica, first_replica, hosts[0], hosts[1]]
+        child_policy.distance.return_value = HostDistance.LOCAL
+
+        # shuffle_replicas=False keeps replica ordering deterministic so we can
+        # assert that no leader is forced to the front.
+        policy = TokenAwarePolicy(child_policy, shuffle_replicas=False)
+        policy.populate(cluster, hosts)
+
+        query = Statement(routing_key=b'\x00\x00\x00\x01', keyspace='ks', table='tbl')
+        qplan = list(policy.make_query_plan(None, query))
+
+        self.assertEqual(qplan[0], second_replica)
+        self.assertEqual(len(qplan), 4)
 
 
 class ConvictionPolicyTest(unittest.TestCase):
