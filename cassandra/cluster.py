@@ -5042,8 +5042,17 @@ class ResponseFuture(object):
                 cb = partial(self._set_result, host, connection, pool)
 
             if isinstance(message, ExecuteMessage):
-                # V2 routing is negotiated per connection, so decide whether to
-                # attach the tablet_version_block based on the target host's pool.
+                # Whether to attach the tablet_version_block depends on whether the
+                # target *host* speaks TABLETS_ROUTING_V2. `pool` here is the
+                # HostConnection for that host: in the ScyllaDB driver a pool maps
+                # one-to-one to a host and holds one connection per shard, not a
+                # single connection. V2 is negotiated (via SUPPORTED/STARTUP) the
+                # same way on every connection to a host, so the flag is uniform
+                # across the pool's shard connections; the pool caches it from the
+                # first connection's features. We read it here -- before
+                # borrow_connection() picks a specific shard connection below --
+                # because the pool is the earliest place that knows the host's V2
+                # capability without reaching into an individual connection.
                 if getattr(pool, 'tablets_routing_v2', False):
                     message.tablet_version_block = self.session._compute_tablet_version_block(self.query)
                 else:
