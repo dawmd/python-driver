@@ -9,26 +9,26 @@ from uuid import UUID
 _get_first_token = attrgetter("first_token")
 _get_last_token = attrgetter("last_token")
 
-# Counter for round-robin block index selection (0-15). Concurrent reads/writes
-# from multiple request threads are intentionally unsynchronised: a lost update
-# only skips/repeats a block index, which is harmless for the round-robin probe.
-_block_index_counter = 0
-
 
 def choose_tablet_version_block(tablet_version):
     """
     Encode a tablet_version_block byte from a cached tablet_version.
-    Picks a block index round-robin across calls.
+    Picks a block index at random across calls.
     Returns an int in [0, 255].
 
     The byte layout matches the server (see locator::compare_tablet_version_block):
     the high nibble is the block index, the low nibble is the value of that block.
     Blocks are indexed from the least significant bits to the most significant ones,
     so block `idx` occupies bits [idx*4, idx*4 + 4).
+
+    The index is chosen randomly rather than round-robin on purpose: this runs on
+    the hot path of every V2 request, so we avoid any shared mutable counter (which
+    would be a cross-core contention point) and only need each of the 16 nibbles to
+    be probed often enough that a server-side version change is detected quickly.
     """
-    global _block_index_counter
-    idx = _block_index_counter & 0xF
-    _block_index_counter = (_block_index_counter + 1) & 0xF
+    # Pick the block index in [0, 15]; getrandbits(4) is a fast C call with no
+    # application-level shared state.
+    idx = getrandbits(4)
     # Extract the 4-bit nibble at block index `idx` (0 = least significant).
     shift = idx * 4
     nibble = (tablet_version >> shift) & 0xF

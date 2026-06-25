@@ -168,41 +168,34 @@ class TabletVersionBlockTest(unittest.TestCase):
 
     def test_choose_tablet_version_block_matches_server(self):
         """Every block produced by the driver must match the server's check."""
-        import cassandra.tablets as tablets_module
         version = 0x0123456789ABCDEF
-        tablets_module._block_index_counter = 0
-        for _ in range(16):
+        # The index is chosen randomly; sample enough times to exercise many indices.
+        for _ in range(256):
             block = choose_tablet_version_block(version)
             self.assertTrue(self._server_block_matches(version, block),
                 f"Block 0x{block:02X} did not match server check for version 0x{version:016X}")
 
-    def test_choose_tablet_version_block_round_robin(self):
-        """Verify that choose_tablet_version_block cycles through block indices."""
-        version = 0xFFFFFFFFFFFFFFFF  # All nibbles are 0xF
-        import cassandra.tablets as tablets_module
-        # Reset the counter to a known state.
-        tablets_module._block_index_counter = 0
-
-        seen_indices = []
-        for _ in range(16):
+    def test_choose_tablet_version_block_index_in_range_and_value_correct(self):
+        """The block index must be in [0, 15] and its value nibble must equal the
+        corresponding nibble of the version (regardless of which index is picked)."""
+        version = 0x0123456789ABCDEF
+        for _ in range(256):
             block = choose_tablet_version_block(version)
             idx = (block >> 4) & 0xF
-            seen_indices.append(idx)
+            value = block & 0xF
+            self.assertTrue(0 <= idx <= 15)
+            self.assertEqual(value, (version >> (idx * 4)) & 0xF)
 
-        # Should have cycled through 0..15.
-        self.assertEqual(seen_indices, list(range(16)))
-
-    def test_choose_tablet_version_block_wraps(self):
-        """Verify that the counter wraps around after 16 calls."""
-        version = 0xABCDABCDABCDABCD
-        import cassandra.tablets as tablets_module
-        tablets_module._block_index_counter = 15
-
-        block1 = choose_tablet_version_block(version)
-        self.assertEqual((block1 >> 4) & 0xF, 15)
-
-        block2 = choose_tablet_version_block(version)
-        self.assertEqual((block2 >> 4) & 0xF, 0)
+    def test_choose_tablet_version_block_covers_all_indices(self):
+        """Over many calls the random index selection should probe every block
+        index, so that any server-side version change is eventually detected."""
+        version = 0xFFFFFFFFFFFFFFFF  # All nibbles are 0xF
+        seen_indices = set()
+        # 16 indices; 1000 draws makes a missing index astronomically unlikely.
+        for _ in range(1000):
+            block = choose_tablet_version_block(version)
+            seen_indices.add((block >> 4) & 0xF)
+        self.assertEqual(seen_indices, set(range(16)))
 
     def test_random_tablet_version_block_returns_byte(self):
         """Verify random_tablet_version_block returns a value in [0, 255]."""
