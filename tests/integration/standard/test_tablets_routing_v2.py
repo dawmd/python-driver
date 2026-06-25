@@ -19,7 +19,7 @@ import pytest
 
 import cassandra.cqltypes as types
 from cassandra import ConsistencyLevel
-from cassandra.cluster import Cluster
+from cassandra.cluster import Cluster, ExecutionProfile, EXEC_PROFILE_DEFAULT
 from cassandra.policies import ConstantReconnectionPolicy, RoundRobinPolicy, TokenAwarePolicy
 from cassandra.protocol import ExecuteMessage, ProtocolException
 from cassandra.protocol_features import (
@@ -75,7 +75,10 @@ class TestTabletsRoutingV2Integration:
     def setup_class(cls):
         cls.cluster = Cluster(contact_points=["127.0.0.1", "127.0.0.2", "127.0.0.3"],
                               protocol_version=PROTOCOL_VERSION,
-                              load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()),
+                              execution_profiles={
+                                  EXEC_PROFILE_DEFAULT: ExecutionProfile(
+                                      load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()))
+                              },
                               reconnection_policy=ConstantReconnectionPolicy(1))
         cls.session = cls.cluster.connect()
         cls._create_schema(cls.session)
@@ -260,7 +263,10 @@ class TestTabletsRoutingV2Integration:
         ProtocolFeatures.add_startup_options = _startup_with_both_extensions
         cluster = Cluster(contact_points=["127.0.0.1", "127.0.0.2", "127.0.0.3"],
                           protocol_version=PROTOCOL_VERSION,
-                          load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()),
+                          execution_profiles={
+                              EXEC_PROFILE_DEFAULT: ExecutionProfile(
+                                  load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()))
+                          },
                           reconnection_policy=ConstantReconnectionPolicy(1))
         try:
             session = cluster.connect('test_v2')
