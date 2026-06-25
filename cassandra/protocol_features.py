@@ -10,7 +10,11 @@ LWT_ADD_METADATA_MARK = "SCYLLA_LWT_ADD_METADATA_MARK"
 LWT_OPTIMIZATION_META_BIT_MASK = "LWT_OPTIMIZATION_META_BIT_MASK"
 RATE_LIMIT_ERROR_EXTENSION = "SCYLLA_RATE_LIMIT_ERROR"
 TABLETS_ROUTING_V1 = "TABLETS_ROUTING_V1"
-TABLETS_ROUTING_V2 = "TABLETS_ROUTING_V2"
+# The server advertises and expects this exact extension name in SUPPORTED/STARTUP
+# (see scylladb transport/cql_protocol_extension.cc). While the feature is gated
+# behind the server's `strongly-consistent-tables` experimental flag, the wire
+# name carries the `_EXPERIMENTAL` suffix.
+TABLETS_ROUTING_V2 = "TABLETS_ROUTING_V2_EXPERIMENTAL"
 
 class ProtocolFeatures(object):
     rate_limit_error = None
