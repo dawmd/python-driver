@@ -3059,16 +3059,14 @@ class Session(object):
                 continuous_paging_options, statement_keyspace)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
-            tablet_version_block = None
-            if self.cluster.control_connection._tablets_routing_v2:
-                tablet_version_block = self._compute_tablet_version_block(query)
+            # The tablet_version_block is filled in per-target-host at send time
+            # (see ResponseFuture._query), because V2 is negotiated per connection.
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
                 skip_meta=bool(prepared_statement.result_metadata),
                 continuous_paging_options=continuous_paging_options,
-                result_metadata_id=prepared_statement.result_metadata_id,
-                tablet_version_block=tablet_version_block)
+                result_metadata_id=prepared_statement.result_metadata_id)
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -5043,6 +5041,14 @@ class ResponseFuture(object):
             if cb is None:
                 cb = partial(self._set_result, host, connection, pool)
 
+            if isinstance(message, ExecuteMessage):
+                # V2 routing is negotiated per connection, so decide whether to
+                # attach the tablet_version_block based on the target host's pool.
+                if getattr(pool, 'tablets_routing_v2', False):
+                    message.tablet_version_block = self.session._compute_tablet_version_block(self.query)
+                else:
+                    message.tablet_version_block = None
+
             self.request_encoded_size = connection.send_msg(message, request_id, cb=cb,
                                                             encoder=self._protocol_handler.encode_message,
                                                             decoder=self._protocol_handler.decode_message,
@@ -5166,13 +5172,13 @@ class ResponseFuture(object):
                     info = self._custom_payload.get('tablets-routing-v2')
                     ctype = ResponseFuture._TABLET_ROUTING_V2_CTYPE
                     if ctype is None:
-                        ctype = types.lookup_casstype('TupleType(LongType, LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))')
+                        ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)), LongType)')
                         ResponseFuture._TABLET_ROUTING_V2_CTYPE = ctype
                     tablet_routing_info = ctype.from_binary(info, protocol)
-                    tablet_version = tablet_routing_info[0]
-                    first_token = tablet_routing_info[1]
-                    last_token = tablet_routing_info[2]
-                    tablet_replicas = tablet_routing_info[3]
+                    first_token = tablet_routing_info[0]
+                    last_token = tablet_routing_info[1]
+                    tablet_replicas = tablet_routing_info[2]
+                    tablet_version = tablet_routing_info[3]
                     tablet = Tablet.from_row(first_token, last_token, tablet_replicas, tablet_version)
                     keyspace = self.query.keyspace
                     table = self.query.table

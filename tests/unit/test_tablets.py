@@ -130,28 +130,51 @@ class TabletVersionBlockTest(unittest.TestCase):
     """Tests for tablet_version_block encoding used by TABLETS_ROUTING_V2."""
 
     def test_choose_tablet_version_block_encoding(self):
-        """Verify that the block byte encodes (index << 4) | nibble correctly."""
+        """Verify that the block byte encodes (index << 4) | nibble correctly.
+
+        This mirrors the server's canonical encoding in
+        locator::tablet_version_block / extract_tablet_version_block:
+        block `idx` occupies bits [idx*4, idx*4 + 4) (least significant first).
+        """
         # Version 0x123456789ABCDEF0:
-        # block 0 = 0x1, block 1 = 0x2, ..., block 15 = 0x0
+        # block 0 (LSB nibble) = 0x0, block 1 = 0xF, ..., block 15 (MSB) = 0x1
         version = 0x123456789ABCDEF0
 
-        # Manually check a few blocks.
-        # Block 0: shift = (15-0)*4 = 60, nibble = (version >> 60) & 0xF = 0x1
-        block = choose_tablet_version_block.__wrapped__(version, 0) if hasattr(choose_tablet_version_block, '__wrapped__') else self._extract_block(version, 0)
-        # Use the actual function with a known index by testing properties:
         for idx in range(16):
-            shift = (15 - idx) * 4
+            shift = idx * 4
             expected_nibble = (version >> shift) & 0xF
             expected_byte = (idx << 4) | expected_nibble
             actual = self._extract_block(version, idx)
             self.assertEqual(actual, expected_byte,
                 f"Block {idx}: expected 0x{expected_byte:02X}, got 0x{actual:02X}")
+            # The byte must round-trip through the server's matching logic.
+            self.assertTrue(self._server_block_matches(version, actual))
 
     def _extract_block(self, version, idx):
-        """Manually compute the expected block byte for verification."""
-        shift = (15 - idx) * 4
+        """Manually compute the expected block byte for verification.
+
+        Matches the server's extract_tablet_version_block helper.
+        """
+        shift = idx * 4
         nibble = (version >> shift) & 0xF
         return (idx << 4) | nibble
+
+    def _server_block_matches(self, version, block):
+        """Reimplements the server's locator::compare_tablet_version_block."""
+        block_value = block & 0x0F
+        block_index = (block & 0xF0) >> 4
+        hash_block = (version >> (block_index * 4)) & 0x0F
+        return hash_block == block_value
+
+    def test_choose_tablet_version_block_matches_server(self):
+        """Every block produced by the driver must match the server's check."""
+        import cassandra.tablets as tablets_module
+        version = 0x0123456789ABCDEF
+        tablets_module._block_index_counter = 0
+        for _ in range(16):
+            block = choose_tablet_version_block(version)
+            self.assertTrue(self._server_block_matches(version, block),
+                f"Block 0x{block:02X} did not match server check for version 0x{version:016X}")
 
     def test_choose_tablet_version_block_round_robin(self):
         """Verify that choose_tablet_version_block cycles through block indices."""
