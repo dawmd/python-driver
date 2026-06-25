@@ -13,10 +13,19 @@ the wire under the name `TABLETS_ROUTING_V2_EXPERIMENTAL`. When run against a
 server that does not advertise it (e.g. a released Scylla), every test skips.
 """
 
+from contextlib import contextmanager
+
 import pytest
 
+import cassandra.cqltypes as types
+from cassandra import ConsistencyLevel
 from cassandra.cluster import Cluster
 from cassandra.policies import ConstantReconnectionPolicy, RoundRobinPolicy, TokenAwarePolicy
+from cassandra.protocol import ExecuteMessage, ProtocolException
+from cassandra.protocol_features import (
+    ProtocolFeatures, RATE_LIMIT_ERROR_EXTENSION, LWT_ADD_METADATA_MARK,
+    TABLETS_ROUTING_V1, TABLETS_ROUTING_V2,
+)
 
 from tests.integration import PROTOCOL_VERSION, use_cluster
 
@@ -29,11 +38,36 @@ def setup_module(module):
                         # advertisement of TABLETS_ROUTING_V2_EXPERIMENTAL
                         # (see scylladb transport/controller.cc).
                         'experimental_features': ['lwt', 'udf', 'strongly-consistent-tables'],
+                        # When V2 is negotiated but a request omits the mandatory
+                        # tablet_version_block, the server calls on_internal_error
+                        # (cql3/statements/select_statement.cc). With this set to
+                        # False that raises a catchable error returned to the client
+                        # instead of aborting the node (see test_no_block_*).
+                        'abort_on_internal_error': False,
                     })
     except Exception as exc:
         pytest.skip("Could not start a Scylla cluster with the "
                     "'strongly-consistent-tables' experimental feature: {}".format(exc),
                     allow_module_level=True)
+
+
+def _startup_with_both_extensions(self, options):
+    """
+    Drop-in replacement for ProtocolFeatures.add_startup_options that negotiates
+    BOTH tablets_routing_v1 and tablets_routing_v2 on the same connection.
+
+    The real driver makes the two mutually exclusive (V2 wins). Forcing both lets
+    us prove the server-side precedence rules: scylla checks V2 first and only
+    falls back to V1 when V2 is not set (cql3/statements/select_statement.cc).
+    """
+    if self.rate_limit_error is not None:
+        options[RATE_LIMIT_ERROR_EXTENSION] = ""
+    if self.tablets_routing_v2:
+        options[TABLETS_ROUTING_V2] = ""
+    if self.tablets_routing_v1:
+        options[TABLETS_ROUTING_V1] = ""
+    if self.lwt_info is not None:
+        options[LWT_ADD_METADATA_MARK] = str(self.lwt_info.lwt_meta_bit_mask)
 
 
 class TestTabletsRoutingV2Integration:
@@ -151,3 +185,222 @@ class TestTabletsRoutingV2Integration:
             "Server returned routing info despite a cached, up-to-date "
             "tablet_version; the driver's tablet_version_block encoding likely "
             "disagrees with the server (locator::compare_tablet_version_block)")
+
+    # -- low-level helpers ------------------------------------------------------
+
+    @staticmethod
+    def _right_block(version, idx=0):
+        """
+        Build a tablet_version_block that the server will accept as a match for
+        block `idx` of `version` (high nibble = index, low nibble = that nibble
+        of the version). Mirrors locator::compare_tablet_version_block.
+        """
+        idx &= 0xF
+        return (idx << 4) | ((version >> (idx * 4)) & 0xF)
+
+    def _send_raw_execute(self, conn, bound, tablet_version_block):
+        """
+        Send an EXECUTE directly on a specific shard connection with a chosen
+        tablet_version_block (or None to omit the byte entirely, i.e. behave like
+        the pre-V2 protocol), and return the decoded response message.
+
+        This bypasses ResponseFuture/load balancing so we control exactly which
+        node+shard the request hits and which byte is on the wire; it also avoids
+        polluting the driver's tablet cache.
+        """
+        ps = bound.prepared_statement
+        msg = ExecuteMessage(
+            ps.query_id, bound.values, ConsistencyLevel.LOCAL_ONE,
+            serial_consistency_level=None, fetch_size=None, paging_state=None,
+            timestamp=None, skip_meta=False,
+            result_metadata_id=ps.result_metadata_id,
+            tablet_version_block=tablet_version_block)
+        return conn.wait_for_response(msg, timeout=30)
+
+    def _decode_v2_payload(self, payload):
+        ctype = types.lookup_casstype(
+            'TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)), LongType)')
+        info = ctype.from_binary(payload['tablets-routing-v2'], self.cluster.protocol_version)
+        return {'first_token': info[0], 'last_token': info[1],
+                'replicas': info[2], 'tablet_version': info[3]}
+
+    def _any_connection(self):
+        for pool in self.session._pools.values():
+            for conn in pool._connections.values():
+                return conn
+        raise AssertionError("no shard connections available")
+
+    @staticmethod
+    def _all_shard_connections(session):
+        for host, pool in session._pools.items():
+            for shard, conn in pool._connections.items():
+                yield host, shard, conn
+
+    @staticmethod
+    def _wait_for_shard_connections(session, timeout=30):
+        """Wait until each pool has filled its shard-aware connections (background)."""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if all(
+                len(pool._connections) >= (min(host.sharding_info.shards_count, 2)
+                                           if host.sharding_info else 1)
+                for host, pool in session._pools.items()
+            ):
+                return
+            time.sleep(0.05)
+
+    @contextmanager
+    def _cluster_with_v1_and_v2(self):
+        """
+        Yield a (cluster, session) whose connections negotiated BOTH V1 and V2.
+        Restores the original startup behaviour and shuts the cluster down on exit.
+        """
+        original = ProtocolFeatures.add_startup_options
+        ProtocolFeatures.add_startup_options = _startup_with_both_extensions
+        cluster = Cluster(contact_points=["127.0.0.1", "127.0.0.2", "127.0.0.3"],
+                          protocol_version=PROTOCOL_VERSION,
+                          load_balancing_policy=TokenAwarePolicy(RoundRobinPolicy()),
+                          reconnection_policy=ConstantReconnectionPolicy(1))
+        try:
+            session = cluster.connect('test_v2')
+            self._wait_for_shard_connections(session)
+            yield cluster, session
+        finally:
+            cluster.shutdown()
+            ProtocolFeatures.add_startup_options = original
+
+    @staticmethod
+    def _find_replica_wrong_shard(session, tablet):
+        """
+        Find a connection to a host that *is* a replica of `tablet` but on a shard
+        that the host does NOT own for it ("right node, wrong shard"). Returns
+        (host, owner_shard, wrong_shard, conn) or None if no host has >=2 shards.
+        """
+        replica_shard = {host_id: shard for host_id, shard in tablet.replicas}
+        for host, pool in session._pools.items():
+            owner = replica_shard.get(host.host_id)
+            if owner is None:
+                continue
+            for shard, conn in pool._connections.items():
+                if shard != owner:
+                    return host, owner, shard, conn
+        return None
+
+    # -- scenario tests ---------------------------------------------------------
+
+    def test_index0_all_block_values_exactly_one_match(self):
+        """
+        Scenario 1: for block index 0, exactly one of the 16 possible values
+        matches the server's tablet_version; every other value is reported as a
+        mismatch carrying that same tablet_version, whose nibble 0 equals the
+        value that matched.
+        """
+        self._skip_if_no_v2()
+        select = self.session.prepare("SELECT v FROM test_v2.t WHERE pk = ?")
+        bound = select.bind([11])
+        tablet = self._ensure_cached(bound)
+        version = tablet.tablet_version
+
+        conn = self._any_connection()
+
+        matched_values = []
+        reported_versions = []
+        for value in range(16):
+            block = value  # index 0 -> high nibble 0, low nibble = value
+            resp = self._send_raw_execute(conn, bound, block)
+            payload = resp.custom_payload or {}
+            if 'tablets-routing-v2' in payload:
+                reported_versions.append(self._decode_v2_payload(payload)['tablet_version'])
+            else:
+                matched_values.append(value)
+
+        # Exactly one value matches: the low nibble of the version.
+        assert matched_values == [version & 0xF], \
+            "expected exactly one matching block value, got {}".format(matched_values)
+        # All 15 mismatches report the same tablet_version ...
+        assert len(reported_versions) == 15
+        assert set(reported_versions) == {version}
+        # ... and that version's block-0 nibble is the value that matched.
+        assert (version & 0xF) == matched_values[0]
+
+    def test_right_block_to_all_nodes_and_shards_never_returns_payload(self):
+        """
+        Scenario 2: a correct tablet_version_block matches on every node and every
+        shard (the server's V2 check ignores shard), so no routing payload is ever
+        returned.
+        """
+        self._skip_if_no_v2()
+        select = self.session.prepare("SELECT v FROM test_v2.t WHERE pk = ?")
+        bound = select.bind([13])
+        tablet = self._ensure_cached(bound)
+        version = tablet.tablet_version
+
+        sent = 0
+        for host, shard, conn in self._all_shard_connections(self.session):
+            # Vary the block index per shard to also exercise non-zero indices.
+            block = self._right_block(version, idx=shard)
+            resp = self._send_raw_execute(conn, bound, block)
+            payload = resp.custom_payload or {}
+            assert 'tablets-routing-v2' not in payload, (
+                "host {} shard {} returned a routing payload for a correct "
+                "tablet_version_block".format(host, shard))
+            sent += 1
+        assert sent >= 1, "no shard connections were exercised"
+
+    def test_v2_takes_precedence_over_v1_no_v1_payload_on_wrong_shard(self):
+        """
+        Scenario 3: with BOTH V1 and V2 negotiated, send a correct V2 block to the
+        wrong shard. The server checks V2 first; since the block matches there is
+        no payload at all -- crucially no `tablets-routing-v1`, which V1 would have
+        emitted for a wrong-shard request.
+        """
+        self._skip_if_no_v2()
+        select = self.session.prepare("SELECT v FROM test_v2.t WHERE pk = ?")
+        bound = select.bind([17])
+        tablet = self._ensure_cached(bound)
+        version = tablet.tablet_version
+
+        with self._cluster_with_v1_and_v2() as (_cluster, session):
+            target = self._find_replica_wrong_shard(session, tablet)
+            if target is None:
+                pytest.skip("need a replica host with >=2 shards to target a wrong shard")
+            _host, _owner_shard, _wrong_shard, conn = target
+            assert conn.features.tablets_routing_v1 and conn.features.tablets_routing_v2, \
+                "test setup failed: connection did not negotiate both V1 and V2"
+
+            resp = self._send_raw_execute(conn, bound, self._right_block(version))
+            payload = resp.custom_payload or {}
+            assert 'tablets-routing-v1' not in payload, (
+                "server emitted V1 routing info despite V2 being negotiated; "
+                "V2 must take precedence (select_statement.cc)")
+            # The correct V2 block also means no V2 payload.
+            assert 'tablets-routing-v2' not in payload
+
+    def test_v2_negotiated_missing_block_returns_protocol_error(self):
+        """
+        Scenario 4: same setup as scenario 3 (both V1 and V2 negotiated, wrong
+        shard) but follow the old V1 protocol and send NO tablet_version_block.
+
+        Because V2 is negotiated the server's request parser unconditionally reads
+        the mandatory trailing byte (transport/server.cc). Omitting it leaves the
+        frame one byte short, so the server rejects the request with a protocol
+        error (code 0x000A) rather than silently falling back to V1.
+        """
+        self._skip_if_no_v2()
+        select = self.session.prepare("SELECT v FROM test_v2.t WHERE pk = ?")
+        bound = select.bind([19])
+        tablet = self._ensure_cached(bound)
+
+        with self._cluster_with_v1_and_v2() as (_cluster, session):
+            target = self._find_replica_wrong_shard(session, tablet)
+            if target is None:
+                pytest.skip("need a replica host with >=2 shards to target a wrong shard")
+            _host, _owner_shard, _wrong_shard, conn = target
+            assert conn.features.tablets_routing_v1 and conn.features.tablets_routing_v2, \
+                "test setup failed: connection did not negotiate both V1 and V2"
+
+            with pytest.raises(ProtocolException) as exc_info:
+                self._send_raw_execute(conn, bound, None)
+            assert exc_info.value.code == 0x000A, \
+                "expected a protocol error, got: {!r}".format(exc_info.value)
