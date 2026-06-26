@@ -3119,7 +3119,7 @@ class Session(object):
         if token_map is None:
             return random_tablet_version_block()
 
-        t = token_map.token_class.from_key(routing_key)
+        t = query.routing_token(token_map.token_class)
         tablet = self.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
         if tablet is None or tablet.tablet_version is None:
             return random_tablet_version_block()
@@ -5038,7 +5038,12 @@ class ResponseFuture(object):
         try:
             # TODO get connectTimeout from cluster settings
             if self.query:
-                connection, request_id = pool.borrow_connection(timeout=2.0, routing_key=self.query.routing_key, keyspace=self.query.keyspace, table=self.query.table)
+                # Pass the statement so the pool can reuse the ring token it
+                # memoized for this request instead of re-hashing the routing key.
+                connection, request_id = pool.borrow_connection(
+                    timeout=2.0, routing_key=self.query.routing_key,
+                    keyspace=self.query.keyspace, table=self.query.table,
+                    query=self.query)
             else:
                 connection, request_id = pool.borrow_connection(timeout=2.0)
             self._connection = connection
