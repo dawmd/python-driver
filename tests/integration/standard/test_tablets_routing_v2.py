@@ -101,6 +101,25 @@ class TestTabletsRoutingV2Integration:
         for i in range(50):
             session.execute(prepared.bind((i, i)))
 
+        # A strongly-consistent (Raft) keyspace, used to exercise leader-aware
+        # routing. `consistency = 'global'` is currently the only strongly
+        # consistent mode the server implements; it requires the
+        # 'strongly-consistent-tables' feature that the module-level setup already
+        # enabled. RF=3 on the 3-node cluster makes every node a replica, so each
+        # tablet has a single, well-defined Raft leader to route to.
+        session.execute("DROP KEYSPACE IF EXISTS test_v2_sc")
+        session.execute(
+            """
+            CREATE KEYSPACE test_v2_sc
+            WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}
+            AND tablets = {'initial': 8}
+            AND consistency = 'global'
+            """)
+        session.execute("CREATE TABLE test_v2_sc.t (pk int PRIMARY KEY, v int)")
+        prepared_sc = session.prepare("INSERT INTO test_v2_sc.t (pk, v) VALUES (?, ?)")
+        for i in range(50):
+            session.execute(prepared_sc.bind((i, i)))
+
     # -- helpers ----------------------------------------------------------------
 
     def _v2_negotiated(self):
@@ -410,3 +429,52 @@ class TestTabletsRoutingV2Integration:
                 self._send_raw_execute(conn, bound, None)
             assert exc_info.value.code == 0x000A, \
                 "expected a protocol error, got: {!r}".format(exc_info.value)
+
+    # -- strongly-consistent (leader-aware) routing -----------------------------
+
+    def test_strongly_consistent_keyspace_metadata(self):
+        """
+        The driver must learn from system_schema.scylla_keyspaces which keyspaces
+        are strongly consistent: test_v2_sc (consistency='global') is, test_v2
+        (no consistency clause) is not. This flag is the precondition for
+        leader-aware routing in TokenAwarePolicy.make_query_plan.
+        """
+        self._skip_if_no_v2()
+        self.session.cluster.refresh_schema_metadata()
+        keyspaces = self.session.cluster.metadata.keyspaces
+        assert keyspaces['test_v2_sc'].strongly_consistent is True
+        assert keyspaces['test_v2'].strongly_consistent is False
+
+    def test_leader_aware_routing_targets_the_raft_leader(self):
+        """
+        For a strongly-consistent table the server orders the replica list with
+        the Raft leader first
+        (groups_manager.cc::prepare_replicas_for_sc_tablet_version). Once that
+        payload is cached, a TokenAwarePolicy must route every request for the
+        tablet to replicas[0] (the leader), saving the extra coordinator->leader
+        hop. This is the strongly-consistent counterpart to the eventually
+        consistent test_v2 tests above, which never assert *which* replica is hit.
+        """
+        self._skip_if_no_v2()
+        select = self.session.prepare("SELECT v FROM test_v2_sc.t WHERE pk = ?")
+        bound = select.bind([2])
+
+        tablet = self._ensure_cached(bound)
+        assert tablet.replicas, "strongly-consistent tablet has no replicas"
+        leader_host_id = tablet.replicas[0][0]
+
+        # Leader-first routing only triggers when the keyspace is known to be
+        # strongly consistent.
+        ks_meta = self.session.cluster.metadata.keyspaces['test_v2_sc']
+        assert ks_meta.strongly_consistent is True
+
+        # With an up-to-date cache the block always matches, so the server returns
+        # no further payload and replicas[0] stays the leader; every request must
+        # therefore be coordinated by that leader.
+        for _ in range(10):
+            result = self.session.execute(bound)
+            coordinator = result.response_future.coordinator_host
+            assert coordinator is not None and coordinator.host_id == leader_host_id, (
+                "request coordinated by {} but the Raft leader is replicas[0]={}; "
+                "leader-aware routing did not target the leader".format(
+                    getattr(coordinator, 'host_id', None), leader_host_id))

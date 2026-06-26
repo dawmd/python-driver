@@ -3109,6 +3109,12 @@ class Session(object):
         if not keyspace or not table:
             return random_tablet_version_block()
 
+        # Skip the Murmur3 token hash + tablet lookup when we have no cached
+        # tablets for this table (vnode tables, or tablet tables on cold start);
+        # both correctly fall back to a random block below.
+        if not self.cluster.metadata._tablets.table_has_tablets(keyspace, table):
+            return random_tablet_version_block()
+
         token_map = self.cluster.metadata.token_map
         if token_map is None:
             return random_tablet_version_block()
@@ -5180,8 +5186,12 @@ class ResponseFuture(object):
             self._warnings = getattr(response, 'warnings', None)
             self._custom_payload = getattr(response, 'custom_payload', None)
 
-            if self._custom_payload:
-                if self.session.cluster.control_connection._tablets_routing_v2 and 'tablets-routing-v2' in self._custom_payload:
+            if self._custom_payload and connection is not None:
+                # Parse the routing payload according to what the connection that
+                # *served this request* negotiated, not the control connection:
+                # during a rolling upgrade connections may differ, and each
+                # payload key matches the extension its own connection negotiated.
+                if connection.features.tablets_routing_v2 and 'tablets-routing-v2' in self._custom_payload:
                     protocol = self.session.cluster.protocol_version
                     info = self._custom_payload.get('tablets-routing-v2')
                     ctype = ResponseFuture._TABLET_ROUTING_V2_CTYPE
@@ -5198,7 +5208,7 @@ class ResponseFuture(object):
                     table = self.query.table
                     if tablet:
                         self.session.cluster.metadata._tablets.add_tablet(keyspace, table, tablet)
-                elif self.session.cluster.control_connection._tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
+                elif connection.features.tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
                     protocol = self.session.cluster.protocol_version
                     info = self._custom_payload.get('tablets-routing-v1')
                     ctype = ResponseFuture._TABLET_ROUTING_CTYPE
