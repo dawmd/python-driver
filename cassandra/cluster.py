@@ -5042,18 +5042,23 @@ class ResponseFuture(object):
                 cb = partial(self._set_result, host, connection, pool)
 
             if isinstance(message, ExecuteMessage):
-                # Whether to attach the tablet_version_block depends on whether the
-                # target *host* speaks TABLETS_ROUTING_V2. `pool` here is the
-                # HostConnection for that host: in the ScyllaDB driver a pool maps
-                # one-to-one to a host and holds one connection per shard, not a
-                # single connection. V2 is negotiated (via SUPPORTED/STARTUP) the
-                # same way on every connection to a host, so the flag is uniform
-                # across the pool's shard connections; the pool caches it from the
-                # first connection's features. We read it here -- before
-                # borrow_connection() picks a specific shard connection below --
-                # because the pool is the earliest place that knows the host's V2
-                # capability without reaching into an individual connection.
-                if getattr(pool, 'tablets_routing_v2', False):
+                # Attach the tablet_version_block only when the *specific connection*
+                # we are about to send on negotiated TABLETS_ROUTING_V2. The server
+                # reads the trailing tablet_version_block byte only on connections
+                # that negotiated V2 (gated on the cluster-wide feature), so keying
+                # off the borrowed connection -- which is already in hand here, since
+                # borrow_connection() ran above -- is both necessary and sufficient:
+                #   * a V2 connection always gets the block, even if this pool was
+                #     created (and any cached flag latched) before the cluster
+                #     feature was enabled, e.g. mid rolling-upgrade;
+                #   * a non-V2 connection never gets it, even if a sibling shard
+                #     connection in the same pool already negotiated V2 -- which can
+                #     happen transiently while connections opened before and after
+                #     the feature flip coexist. Attaching the block to a non-V2
+                #     connection would leave an unread trailing byte and desync the
+                #     frame, so a pool-level flag cannot get this right regardless of
+                #     how it is latched.
+                if connection.features.tablets_routing_v2:
                     message.tablet_version_block = self.session._compute_tablet_version_block(self.query)
                 else:
                     message.tablet_version_block = None
