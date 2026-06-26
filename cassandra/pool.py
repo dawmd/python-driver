@@ -392,7 +392,6 @@ class HostConnection(object):
     max_excess_connections_per_shard_multiplier = 3
 
     tablets_routing_v1 = False
-    tablets_routing_v2 = False
 
     def __init__(self, host, host_distance, session):
         self.host = host
@@ -440,9 +439,18 @@ class HostConnection(object):
             self.host.sharding_info = first_connection.features.sharding_info
             self._open_connections_for_all_shards(first_connection.features.shard_id)
         self.tablets_routing_v1 = first_connection.features.tablets_routing_v1
-        self.tablets_routing_v2 = first_connection.features.tablets_routing_v2
 
         log.debug("Finished initializing connection for host %s", self.host)
+
+    # TABLETS_ROUTING_V2 capability is a per-host property gated on the cluster
+    # feature, so it can flip from False to True after the pool is created
+    # (e.g. once the last node finishes a rolling upgrade). Derive it from the
+    # live connections instead of latching a value at init time, which would
+    # otherwise leave the pool stuck on the stale-low value until it is
+    # recreated. any() short-circuits, so the common (enabled) case is cheap.
+    @property
+    def tablets_routing_v2(self):
+        return any(c.features.tablets_routing_v2 for c in self._connections.values())
 
     def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None):
         if self.is_shutdown:
