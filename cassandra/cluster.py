@@ -3058,14 +3058,17 @@ class Session(object):
                 continuous_paging_options, statement_keyspace)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
-            # The tablet_version_block is filled in per-target-host at send time
-            # (see ResponseFuture._query), because V2 is negotiated per connection.
+            # The tablet_version_block value is connection-independent, so compute
+            # it once here instead of copying the message per send attempt. The
+            # serializer emits it only when the serving connection negotiated
+            # TABLETS_ROUTING_V2 (see ExecuteMessage.send_body).
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
                 skip_meta=bool(prepared_statement.result_metadata),
                 continuous_paging_options=continuous_paging_options,
-                result_metadata_id=prepared_statement.result_metadata_id)
+                result_metadata_id=prepared_statement.result_metadata_id,
+                tablet_version_block=self._compute_tablet_version_block(query))
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -3104,8 +3107,10 @@ class Session(object):
         known for the routing key (unknown keyspace/table, vnode table, cold
         cache, or a missing token map) a random block is returned; the server
         treats that as a version miss and replies with fresh routing info.
-        Callers invoke this only for connections that negotiated
-        TABLETS_ROUTING_V2.
+
+        This is computed once per request at message construction; the value is
+        connection-independent, and the serializer emits it only on connections
+        that negotiated TABLETS_ROUTING_V2 (see ExecuteMessage.send_body).
         """
         routing_key = query.routing_key
         if routing_key is None:
@@ -4975,36 +4980,6 @@ class ResponseFuture(object):
             connection.in_flight -= 1
         cb(response)
 
-    def _prepare_message_for_connection(self, message, connection):
-        """
-        Return the message to send on ``connection``, attaching the
-        tablet_version_block to ExecuteMessages according to the capability that
-        *this specific connection* negotiated.
-
-        Keying off the borrowed connection (already in hand at every call site)
-        is both necessary and sufficient: a connection that negotiated
-        TABLETS_ROUTING_V2 always gets the block -- even if the pool was created,
-        and any cached flag latched, before the cluster feature was enabled
-        (e.g. mid rolling-upgrade) -- while a non-V2 connection never gets one,
-        even if a sibling shard connection in the same pool already negotiated
-        V2. The server reads the trailing byte only on V2 connections, so
-        attaching it to a non-V2 connection would leave an unread trailing byte
-        and desync the frame; a pool-level flag cannot get this right.
-
-        ExecuteMessage is copied per send because ``self.message`` is shared
-        across speculative executions and retries that may run concurrently on
-        different threads; mutating tablet_version_block on the shared instance
-        would race with another in-flight send encoding the same object.
-        """
-        if not isinstance(message, ExecuteMessage):
-            return message
-        message = copy(message)
-        if connection.features.tablets_routing_v2:
-            message.tablet_version_block = self.session._compute_tablet_version_block(self.query)
-        else:
-            message.tablet_version_block = None
-        return message
-
     def _query_control_connection(self, message=None, cb=None, connection=None, host=None):
         self._control_connection_query_attempted = True
 
@@ -5032,9 +5007,6 @@ class ResponseFuture(object):
                 cb = partial(self._set_result, host, connection, None)
             cb = partial(self._handle_control_connection_response, connection, cb)
 
-            # The control connection may also be a V2 connection, so it needs the
-            # trailing tablet_version_block byte just like a pooled send.
-            message = self._prepare_message_for_connection(message, connection)
             log.debug("No usable node pools; falling back to control connection for host %s", host)
             self.request_encoded_size = connection.send_msg(message, request_id, cb=cb,
                                                             encoder=self._protocol_handler.encode_message,
@@ -5093,8 +5065,6 @@ class ResponseFuture(object):
 
             if cb is None:
                 cb = partial(self._set_result, host, connection, pool)
-
-            message = self._prepare_message_for_connection(message, connection)
 
             self.request_encoded_size = connection.send_msg(message, request_id, cb=cb,
                                                             encoder=self._protocol_handler.encode_message,
