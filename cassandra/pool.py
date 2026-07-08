@@ -389,8 +389,6 @@ class HostConnection(object):
     # the number below, all excess connections will be closed.
     max_excess_connections_per_shard_multiplier = 3
 
-    tablets_routing_v1 = False
-
     def __init__(self, host, host_distance, session):
         self.host = host
         self.host_distance = host_distance
@@ -436,9 +434,35 @@ class HostConnection(object):
         if first_connection.features.sharding_info and not self._session.cluster.shard_aware_options.disable:
             self.host.sharding_info = first_connection.features.sharding_info
             self._open_connections_for_all_shards(first_connection.features.shard_id)
-        self.tablets_routing_v1 = first_connection.features.tablets_routing_v1
 
         log.debug("Finished initializing connection for host %s", self.host)
+
+    @property
+    def supports_tablet_routing(self):
+        # True when any live connection to this host negotiated a tablet-routing
+        # extension (V1 or V2). Both are treated identically here: the sole use
+        # is deciding whether to consult tablet metadata for shard selection
+        # below. This never affects EXECUTE framing -- that is gated
+        # per-connection on the connection's own negotiated feature -- so a
+        # stale value here can at worst pick a suboptimal shard, never desync a
+        # frame.
+        #
+        # Derive it from the live connections instead of latching a value at
+        # init time: the pool's connection set changes over its lifetime
+        # (reconnects, or a node restarting with a different configuration), and
+        # each fresh connection reports the features it negotiated. Reading the
+        # current connections avoids getting stuck on a stale init-time snapshot.
+        #
+        # Snapshot the values first: iterating self._connections lazily lets a
+        # concurrent shard (re)connection that mutates the dict raise
+        # "dictionary changed size during iteration". Skip closed/defunct
+        # connections so a dead connection cannot keep the capability latched on
+        # while it is being torn down. any() short-circuits, so the common
+        # (enabled) case is cheap.
+        connections = tuple(self._connections.values())
+        return any(c.features.tablets_routing_v1 or c.features.tablets_routing_v2
+                   for c in connections
+                   if not c.is_closed and not c.is_defunct)
 
     def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None, query=None):
         if self.is_shutdown:
@@ -457,14 +481,14 @@ class HostConnection(object):
             t = query.routing_token(token_class) if query is not None else None
             if t is None:
                 t = token_class.from_key(routing_key)
-            
-            shard_id = None
-            if self.tablets_routing_v1 and table is not None:
+            if self.supports_tablet_routing and table is not None:
                 if keyspace is None:
                     keyspace = self._keyspace
 
                 tablet = self._session.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
 
+                # In both V1 and V2 the request is sent to this host, so we pick
+                # the shard that this host owns for the tablet.
                 if tablet is not None:
                     for replica in tablet.replicas:
                         if replica[0] == self.host.host_id:

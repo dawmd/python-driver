@@ -648,8 +648,12 @@ class ExecuteMessage(_QueryMessage):
         if ProtocolVersion.uses_prepared_metadata(protocol_version):
             write_string(f, self.result_metadata_id)
         self._write_query_params(f, protocol_version, protocol_features)
-        if self.tablet_version_block is not None:
-            write_byte(f, self.tablet_version_block)
+        if protocol_features is not None and protocol_features.tablets_routing_v2:
+            # A V2 connection makes the server read exactly one trailing byte per
+            # EXECUTE, so always write one. tablet_version_block is precomputed
+            # (connection-independent) in Session._create_message; coalesce a
+            # missing value to 0 to keep the frame in sync.
+            write_byte(f, self.tablet_version_block if self.tablet_version_block is not None else 0)
 
 
 CUSTOM_TYPE = object()

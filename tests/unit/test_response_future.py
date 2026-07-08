@@ -40,7 +40,6 @@ class ResponseFutureTests(unittest.TestCase):
     def make_basic_session(self):
         s = Mock(spec=Session)
         s.row_factory = lambda col_names, rows: [(col_names, rows)]
-        s.cluster.control_connection._tablets_routing_v1 = False
         s.cluster.allow_control_connection_query_fallback = ControlConnectionQueryFallback.Disabled
         return s
 
@@ -64,6 +63,11 @@ class ResponseFutureTests(unittest.TestCase):
         connection.is_control_connection = True
         connection.get_request_id.return_value = 7
         connection.send_msg.return_value = 128
+        # These tests exercise control-connection query fallback, not tablet
+        # routing; default the tablet features off so _set_result skips
+        # tablet-payload parsing for the mocked responses.
+        connection.features.tablets_routing_v2 = False
+        connection.features.tablets_routing_v1 = False
         return connection
 
     def make_session(self):
@@ -137,6 +141,9 @@ class ResponseFutureTests(unittest.TestCase):
                       kind=RESULT_KIND_SCHEMA_CHANGE,
                       schema_change_event=event_results)
         connection = Mock()
+        # Skip tablet-payload parsing for this mocked response/connection pair.
+        connection.features.tablets_routing_v2 = False
+        connection.features.tablets_routing_v1 = False
         rf._set_result(None, connection, None, result)
         session.submit.assert_called_once_with(ANY, ANY, rf, connection, **event_results)
 

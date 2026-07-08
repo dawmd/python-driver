@@ -84,7 +84,7 @@ from cassandra.query import (SimpleStatement, PreparedStatement, BoundStatement,
                              named_tuple_factory, dict_factory, tuple_factory, FETCH_SIZE_UNSET,
                              HostTargetingStatement)
 from cassandra.marshal import int64_pack
-from cassandra.tablets import Tablet
+from cassandra.tablets import Tablet, Tablets, choose_tablet_version_block, random_tablet_version_block
 from cassandra.timestamps import MonotonicTimestampGenerator
 from cassandra.util import _resolve_contact_points_to_string_map, Version, maybe_add_timeout_to_query
 
@@ -3058,12 +3058,17 @@ class Session(object):
                 continuous_paging_options, statement_keyspace)
         elif isinstance(query, BoundStatement):
             prepared_statement = query.prepared_statement
+            # The tablet_version_block value is connection-independent, so compute
+            # it once here instead of copying the message per send attempt. The
+            # serializer emits it only when the serving connection negotiated
+            # TABLETS_ROUTING_V2 (see ExecuteMessage.send_body).
             message = ExecuteMessage(
                 prepared_statement.query_id, query.values, cl,
                 serial_cl, fetch_size, paging_state, timestamp,
                 skip_meta=bool(prepared_statement.result_metadata),
                 continuous_paging_options=continuous_paging_options,
-                result_metadata_id=prepared_statement.result_metadata_id)
+                result_metadata_id=prepared_statement.result_metadata_id,
+                tablet_version_block=self._compute_tablet_version_block(query))
         elif isinstance(query, BatchStatement):
             if self._protocol_version < 2:
                 raise UnsupportedOperation(
@@ -3091,6 +3096,49 @@ class Session(object):
             prepared_statement=prepared_statement, retry_policy=retry_policy, row_factory=row_factory,
             load_balancer=load_balancing_policy, start_time=start_time, speculative_execution_plan=spec_exec_plan,
             continuous_paging_state=None, host=host)
+
+    def _compute_tablet_version_block(self, query):
+        """
+        Compute the tablet_version_block byte for a BoundStatement.
+
+        Always returns an int in [0, 255]. A non-token-aware query (no routing
+        key) can never resolve to a tablet, so the server never version-checks
+        it; we send 0 and skip the work. Otherwise, when no cached tablet is
+        known for the routing key (unknown keyspace/table, vnode table, cold
+        cache, or a missing token map) a random block is returned; the server
+        treats that as a version miss and replies with fresh routing info.
+
+        This is computed once per request at message construction; the value is
+        connection-independent, and the serializer emits it only on connections
+        that negotiated TABLETS_ROUTING_V2 (see ExecuteMessage.send_body).
+        """
+        routing_key = query.routing_key
+        if routing_key is None:
+            # Non-token-aware query: the server won't version-check it, so skip
+            # generating random bits and just send 0.
+            return 0
+
+        keyspace = query.keyspace or self.keyspace
+        table = query.table
+        if not keyspace or not table:
+            return random_tablet_version_block()
+
+        # Skip the Murmur3 token hash + tablet lookup when we have no cached
+        # tablets for this table (vnode tables, or tablet tables on cold start);
+        # both correctly fall back to a random block below.
+        if not self.cluster.metadata._tablets.table_has_tablets(keyspace, table):
+            return random_tablet_version_block()
+
+        token_map = self.cluster.metadata.token_map
+        if token_map is None:
+            return random_tablet_version_block()
+
+        t = query.routing_token(token_map.token_class)
+        tablet = self.cluster.metadata._tablets.get_tablet_for_key(keyspace, table, t)
+        if tablet is None or tablet.tablet_version is None:
+            return random_tablet_version_block()
+
+        return choose_tablet_version_block(tablet.tablet_version)
 
     def get_execution_profile(self, name):
         """
@@ -3768,7 +3816,6 @@ class ControlConnection(object):
     _schema_meta_page_size = 1000
 
     _uses_peers_v2 = True
-    _tablets_routing_v1 = False
 
     # for testing purposes
     _time = time
@@ -3901,8 +3948,6 @@ class ControlConnection(object):
         # Sharding information signals it is ScyllaDB
         self._metadata_request_timeout = None if connection.features.sharding_info is None or not self._cluster.metadata_request_timeout \
             else datetime.timedelta(seconds=self._cluster.metadata_request_timeout)
-
-        self._tablets_routing_v1 = connection.features.tablets_routing_v1
 
         # use weak references in both directions
         # _clear_watcher will be called when this ControlConnection is about to be finalized
@@ -4717,6 +4762,7 @@ class ResponseFuture(object):
     _host = None
     _control_connection_query_attempted = False
     _TABLET_ROUTING_CTYPE = None
+    _TABLET_ROUTING_V2_CTYPE = None
 
     _warned_timeout = False
 
@@ -5122,6 +5168,27 @@ class ResponseFuture(object):
             # try to submit the original prepared statement on some other host
             self.send_request()
 
+    def _cache_tablet_from_payload(self, payload_key, ctype):
+        """
+        Parse a tablets-routing ``custom_payload`` entry and cache the Tablet.
+
+        ``ctype`` is the tuple type for the negotiated extension. The V1 and V2
+        layouts differ only by a trailing ``tablet_version`` field, and
+        ``Tablet.from_row`` accepts that as an optional final argument, so
+        unpacking the decoded tuple positionally serves both. The tablet is
+        cached under the effective keyspace (the statement's, else the
+        session's) so a prepared statement executed in a session keyspace lands
+        under the same key ``_compute_tablet_version_block`` looks it up by;
+        otherwise that lookup always misses.
+        """
+        info = self._custom_payload.get(payload_key)
+        protocol = self.session.cluster.protocol_version
+        tablet = Tablet.from_row(*ctype.from_binary(info, protocol))
+        keyspace = self.query.keyspace or self.session.keyspace
+        table = self.query.table
+        if tablet and keyspace and table:
+            self.session.cluster.metadata._tablets.add_tablet(keyspace, table, tablet)
+
     def _set_result(self, host, connection, pool, response):
         try:
             self.coordinator_host = host
@@ -5137,21 +5204,23 @@ class ResponseFuture(object):
             self._warnings = getattr(response, 'warnings', None)
             self._custom_payload = getattr(response, 'custom_payload', None)
 
-            if self._custom_payload and self.session.cluster.control_connection._tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
-                protocol = self.session.cluster.protocol_version
-                info = self._custom_payload.get('tablets-routing-v1')
-                ctype = ResponseFuture._TABLET_ROUTING_CTYPE
-                if ctype is None:
-                    ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))')
-                    ResponseFuture._TABLET_ROUTING_CTYPE = ctype
-                tablet_routing_info = ctype.from_binary(info, protocol)
-                first_token = tablet_routing_info[0]
-                last_token = tablet_routing_info[1]
-                tablet_replicas = tablet_routing_info[2]
-                tablet = Tablet.from_row(first_token, last_token, tablet_replicas)
-                keyspace = self.query.keyspace
-                table = self.query.table
-                self.session.cluster.metadata._tablets.add_tablet(keyspace, table, tablet)
+            if self._custom_payload and connection is not None:
+                # Parse the routing payload according to what the connection that
+                # *served this request* negotiated, not the control connection:
+                # different nodes may negotiate different extensions, and each
+                # payload key matches the extension its own connection negotiated.
+                if connection.features.tablets_routing_v2 and 'tablets-routing-v2' in self._custom_payload:
+                    ctype = ResponseFuture._TABLET_ROUTING_V2_CTYPE
+                    if ctype is None:
+                        ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)), LongType)')
+                        ResponseFuture._TABLET_ROUTING_V2_CTYPE = ctype
+                    self._cache_tablet_from_payload('tablets-routing-v2', ctype)
+                elif connection.features.tablets_routing_v1 and 'tablets-routing-v1' in self._custom_payload:
+                    ctype = ResponseFuture._TABLET_ROUTING_CTYPE
+                    if ctype is None:
+                        ctype = types.lookup_casstype('TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))')
+                        ResponseFuture._TABLET_ROUTING_CTYPE = ctype
+                    self._cache_tablet_from_payload('tablets-routing-v1', ctype)
 
             if isinstance(response, ResultMessage):
                 if response.kind == RESULT_KIND_SET_KEYSPACE:
