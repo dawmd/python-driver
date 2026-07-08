@@ -468,6 +468,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
 
     _child_policy = None
     _cluster_metadata = None
+    _cluster = None
     shuffle_replicas = True
     """
     Yield local replicas in a random order.
@@ -479,6 +480,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
 
     def populate(self, cluster, hosts):
         self._cluster_metadata = cluster.metadata
+        self._cluster = cluster
         self._child_policy.populate(cluster, hosts)
 
     def check_supported(self):
@@ -503,6 +505,7 @@ class TokenAwarePolicy(LoadBalancingPolicy):
             return
 
         replicas = []
+        leader_host = None
         token = query.routing_token(self._cluster_metadata.token_map.token_class)
         tablet = self._cluster_metadata._tablets.get_tablet_for_key(keyspace, query.table, token)
 
@@ -511,6 +514,40 @@ class TokenAwarePolicy(LoadBalancingPolicy):
             child_plan = child.make_query_plan(keyspace, query)
 
             replicas = [host for host in child_plan if host.host_id in replicas_mapped]
+
+            # The leader concept only exists for strongly-consistent keyspaces.
+            # TABLETS_ROUTING_V2 assigns a tablet_version to *every* tablet table
+            # (eventually- and strongly-consistent alike), so the version alone
+            # must not be used to infer a leader. Conversely, replicas[0] is only
+            # leader-ordered for a tablet that came from a V2 payload, so a
+            # versionless tablet (V1-sourced, or stale across a consistency flip)
+            # must not be treated as a leader hint either. Require both a
+            # strongly-consistent keyspace and a versioned tablet; otherwise keep
+            # normal token-aware/shuffled ordering.
+            ks_meta = self._cluster_metadata.keyspaces.get(keyspace)
+            if (ks_meta is not None and ks_meta._strongly_consistent
+                    and tablet.tablet_version is not None and tablet.replicas):
+                # Even for a leader-eligible tablet, a request at consistency
+                # level ONE or LOCAL_ONE is satisfied by any single replica, so
+                # preferring the leader would only concentrate load into a
+                # hotspot without buying any consistency; spread those instead.
+                # LWTs are the exception -- their Paxos/Raft rounds are
+                # coordinated on the leader regardless of the (learn-phase)
+                # consistency level, so they keep preferring it. A None
+                # consistency_level defers to the execution profile, so resolve
+                # it against the default profile to evaluate the *effective*
+                # level (as the session does when building the request).
+                effective_cl = query.consistency_level
+                if effective_cl is None and self._cluster is not None:
+                    effective_cl = self._cluster.profile_manager.default.consistency_level
+                prefer_leader = query.is_lwt() or effective_cl not in (
+                    ConsistencyLevel.ONE, ConsistencyLevel.LOCAL_ONE)
+                if prefer_leader:
+                    leader_host_id = tablet.replicas[0][0]
+                    for host in replicas:
+                        if host.host_id == leader_host_id:
+                            leader_host = host
+                            break
         else:
             replicas = self._cluster_metadata.get_replicas(keyspace, query.routing_key)
 
@@ -523,10 +560,21 @@ class TokenAwarePolicy(LoadBalancingPolicy):
                     if replica.is_up and child.distance(replica) == distance:
                         yield replica
 
-        # yield replicas: local_rack, local, remote
-        yield from yield_in_order(replicas)
+        # If we have a leader hint, yield it first -- but respect the child
+        # policy's own filter: never front-run a host the child policy would
+        # exclude (e.g. one a custom policy reports as IGNORED).
+        if (leader_host is not None and leader_host.is_up
+                and child.distance(leader_host) != HostDistance.IGNORED):
+            yield leader_host
+
+        # yield replicas: local_rack, local, remote (skipping leader already yielded)
+        for host in yield_in_order(replicas):
+            if host is not leader_host:
+                yield host
         # yield rest of the cluster: local_rack, local, remote
-        yield from yield_in_order([host for host in child.make_query_plan(keyspace, query) if host not in replicas])
+        for host in yield_in_order([host for host in child.make_query_plan(keyspace, query) if host not in replicas]):
+            if host is not leader_host:
+                yield host
 
     def on_up(self, *args, **kwargs):
         return self._child_policy.on_up(*args, **kwargs)
