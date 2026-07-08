@@ -440,7 +440,7 @@ class HostConnection(object):
 
         log.debug("Finished initializing connection for host %s", self.host)
 
-    def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None):
+    def _get_connection_for_routing_key(self, routing_key=None, keyspace=None, table=None, query=None):
         if self.is_shutdown:
             raise ConnectionException(
                 "Pool for %s is shutdown" % (self.host,), self.host)
@@ -450,7 +450,13 @@ class HostConnection(object):
 
         shard_id = None
         if not self._session.cluster.shard_aware_options.disable and self.host.sharding_info and routing_key:
-            t = self._session.cluster.metadata.token_map.token_class.from_key(routing_key)
+            token_class = self._session.cluster.metadata.token_map.token_class
+            # Reuse the token the statement already memoized for this request when
+            # available, so the routing-key hash runs once per request instead of
+            # again here; fall back to hashing the routing key directly otherwise.
+            t = query.routing_token(token_class) if query is not None else None
+            if t is None:
+                t = token_class.from_key(routing_key)
             
             shard_id = None
             if self.tablets_routing_v1 and table is not None:
@@ -506,15 +512,15 @@ class HostConnection(object):
             return random.choice(active_connections)
         return random.choice(list(self._connections.values()))
 
-    def borrow_connection(self, timeout, routing_key=None, keyspace=None, table=None):
-        conn = self._get_connection_for_routing_key(routing_key, keyspace, table)
+    def borrow_connection(self, timeout, routing_key=None, keyspace=None, table=None, query=None):
+        conn = self._get_connection_for_routing_key(routing_key, keyspace, table, query)
         start = time.time()
         remaining = timeout
         last_retry = False
         while True:
             if conn.is_closed:
                 # The connection might have been closed in the meantime - if so, try again
-                conn = self._get_connection_for_routing_key(routing_key, keyspace, table)
+                conn = self._get_connection_for_routing_key(routing_key, keyspace, table, query)
             with conn.lock:
                 if (not conn.is_closed or last_retry) and conn.in_flight < conn.max_request_id:
                     # On last retry we ignore connection status, since it is better to return closed connection than

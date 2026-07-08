@@ -5006,7 +5006,12 @@ class ResponseFuture(object):
         try:
             # TODO get connectTimeout from cluster settings
             if self.query:
-                connection, request_id = pool.borrow_connection(timeout=2.0, routing_key=self.query.routing_key, keyspace=self.query.keyspace, table=self.query.table)
+                # Pass the statement so the pool can reuse the ring token it
+                # memoized for this request instead of re-hashing the routing key.
+                connection, request_id = pool.borrow_connection(
+                    timeout=2.0, routing_key=self.query.routing_key,
+                    keyspace=self.query.keyspace, table=self.query.table,
+                    query=self.query)
             else:
                 connection, request_id = pool.borrow_connection(timeout=2.0)
             self._connection = connection

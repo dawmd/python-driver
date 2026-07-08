@@ -503,8 +503,8 @@ class TokenAwarePolicy(LoadBalancingPolicy):
             return
 
         replicas = []
-        tablet = self._cluster_metadata._tablets.get_tablet_for_key(
-            keyspace, query.table, self._cluster_metadata.token_map.token_class.from_key(query.routing_key))
+        token = query.routing_token(self._cluster_metadata.token_map.token_class)
+        tablet = self._cluster_metadata._tablets.get_tablet_for_key(keyspace, query.table, token)
 
         if tablet is not None:
             replicas_mapped = set(map(lambda r: r[0], tablet.replicas))
